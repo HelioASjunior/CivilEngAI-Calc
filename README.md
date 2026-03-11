@@ -10,7 +10,6 @@ Uma plataforma avançada de **Engenharia Civil** que combina o rigor dos cálcul
 * **📊 Dashboard de Cálculos:** Módulos de cálculo determinístico para estruturas (flexão, cisalhamento), geotecnia e hidráulica.
 * **💬 Assistente Técnico (IA):** Chat especializado treinado para interpretar normas brasileiras (NBRs).
 * **📸 Input por Print (CTRL+V):** Suporte exclusivo para colar diagramas do Ftool, AutoCAD ou fotos de obra diretamente no chat para análise instantânea.
-* **🌓 Interface Adaptativa:** Modos Dark (Black) e Light (White) com correção automática de contraste para fórmulas em LaTeX.
 * **🔐 Segurança de Dados:** Gerenciamento de API Key via interface ou segredos de ambiente, sem exposição de credenciais no código.
 
 ---
