@@ -5,10 +5,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from google import genai
 from PIL import Image, ImageOps
 from streamlit_paste_button import paste_image_button
+from PyPDF2 import PdfReader
 
 
 # Funcoes matematicas puras de engenharia civil (sem efeito colateral).
@@ -99,15 +101,50 @@ def preprocess_pil_image(image: Image.Image) -> PreparedImage:
     return PreparedImage(bytes_data=buffer.getvalue(), mime_type="image/jpeg", pil_image=normalized)
 
 
-def build_engineering_system_instruction() -> str:
+def build_engineering_system_instruction(pdf_context: Optional[str] = None) -> str:
     # Instrucao de sistema fixa para orientar o modelo em respostas tecnicas.
-    return (
-        "Voce e um calculista estrutural. "
-        "Responda com precisao matematica, cite a NBR 6118 e use unidades do SI. "
-        "Formate a resposta como relatorio tecnico em Markdown, incluindo: "
-        "(1) resumo do problema, (2) premissas adotadas, (3) tabela de dados de entrada, "
-        "(4) formulas em LaTeX, (5) calculo passo a passo, (6) conclusao objetiva."
+    base_instruction = (
+        "Voce e um Engenheiro Civil Senior Multidisciplinar. "
+        "Escopo total: responda sobre todas as areas da Engenharia Civil, incluindo Estruturas "
+        "(Concreto, Aco, Madeira), Hidraulica e Saneamento, Geotecnia (Solos e Fundacoes), "
+        "Estradas e Transportes, Gerenciamento de Obras e Materiais de Construcao. "
+        "Normas tecnicas: use sempre a norma ABNT pertinente ao assunto. "
+        "Exemplos: para perda de carga, aplique Hidraulica (Bernoulli e Darcy-Weisbach quando pertinente); "
+        "para vigas e elementos estruturais, aplique NBR 6118, NBR 8800 e demais normas aplicaveis. "
+        "Rigor matematico: mantenha precisao absoluta e apresente o passo a passo das formulas antes do resultado final. "
+        "Unidades: use estritamente o SI no resultado final, aceitando entradas em outras unidades "
+        "(como tf e kgf) com conversao explicita e correta. "
+        "Postura: seja direto, tecnico e consultivo. "
+        "Se houver imagem (planta, diagrama de momentos, tabela, print tecnico), analise os dados visuais "
+        "com foco em seguranca estrutural, eficiencia tecnica e conformidade normativa. "
+        "Formato obrigatorio da resposta em Markdown: "
+        "(1) resumo do problema, (2) premissas adotadas, (3) tabela de dados de entrada com unidades, "
+        "(4) formulas em LaTeX, (5) calculo passo a passo com conversoes de unidades, "
+        "(6) verificacoes normativas ABNT, (7) conclusao objetiva com recomendacoes tecnicas."
     )
+    
+    if pdf_context:
+        pdf_instruction = (
+            "\n\n[PRIORIDADE MAXIMA - HIERARQUIA DE BUSCA COM TAGS OBRIGATORIAS]\n"
+            "Para CADA pergunta, siga rigorosamente esta ordem:\n"
+            "1. ANALISE PRIMEIRO o conteudo do MANUAL TECNICO a seguir.\n"
+            "2. Se encontrar a resposta NO MANUAL:\n"
+            "   - INICIE A RESPOSTA COM [FONTE: PDF]\n"
+            "   - Incluia uma citacao DIRETA do texto entre aspas duplas.\n"
+            "   - Exemplo: [FONTE: PDF] De acordo com o manual tecnico: \"texto direto extraido do PDF\".\n"
+            "3. Se a informacao NAO constar no manual ou for insuficiente:\n"
+            "   - INICIE A RESPOSTA COM [FONTE: GLOBAL]\n"
+            "   - Inclua aviso: \"Esta informacao nao consta no manual especifico, mas seguindo as normas gerais de engenharia...\"\n"
+            "4. Em CONFLITO DE INFORMACAO: PRIORIZE O QUE ESTA NO MANUAL (use [FONTE: PDF]).\n"
+            "5. Apos a resposta principal, adicione uma secao [CONTEXTO DA CONSULTA]:\n"
+            "   - Se [FONTE: PDF]: liste o numero estimado de paragrafos/secoes consultados do PDF.\n"
+            "   - Se [FONTE: GLOBAL]: mencione quais normas ABNT ou conceitos foram aplicados.\n\n"
+            "[MANUAL TECNICO CARREGADO]:\n"
+            f"{pdf_context[:8000]}"  # Limita a 8000 caracteres para não sobrecarregar
+        )
+        return base_instruction + pdf_instruction
+    else:
+        return base_instruction
 
 
 def list_available_gemini_models(client: genai.Client) -> list[str]:
@@ -138,9 +175,21 @@ def diagnose_and_pick_model(api_key: str) -> tuple[list[str], Optional[str], Opt
     if not available_models:
         return [], None, "Sua chave não tem modelos ativos. Crie uma nova chave em um NOVO PROJETO no AI Studio."
 
-    # Prioriza modelo Flash quando estiver disponivel.
-    flash_candidates = [m for m in available_models if "flash" in m.lower()]
-    selected_model = flash_candidates[0] if flash_candidates else available_models[0]
+    # Prioriza explicitamente gemini-1.5-flash; se nao existir, usa outro Flash.
+    preferred_models = [
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+    ]
+    selected_model = None
+    for preferred in preferred_models:
+        match = next((m for m in available_models if m.lower() == preferred), None)
+        if match:
+            selected_model = match
+            break
+
+    if not selected_model:
+        flash_candidates = [m for m in available_models if "flash" in m.lower()]
+        selected_model = flash_candidates[0] if flash_candidates else available_models[0]
     return available_models, selected_model, None
 
 
@@ -150,7 +199,19 @@ def is_not_found_error(exc: Exception) -> bool:
     return "404" in message or "NOT_FOUND" in message
 
 
-def ask_gemini(api_key: str, model_name: str, prompt: str, prepared_image: Optional[PreparedImage]) -> str:
+def extract_text_from_pdf(pdf_file) -> str:
+    """Extrai texto de um arquivo PDF enviado pelo usuario."""
+    try:
+        pdf_reader = PdfReader(pdf_file)
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text.strip()
+    except Exception as exc:
+        return f"Erro ao extrair PDF: {exc}"
+
+
+def ask_gemini(api_key: str, model_name: str, prompt: str, prepared_image: Optional[PreparedImage], pdf_context: Optional[str] = None) -> str:
     # Cria cliente Gemini.
     client = genai.Client(api_key=api_key)
 
@@ -160,14 +221,55 @@ def ask_gemini(api_key: str, model_name: str, prompt: str, prepared_image: Optio
     if prepared_image:
         contents.append(prepared_image.pil_image)
 
-    # Gera resposta com instrucao de sistema tecnica.
+    # Gera resposta com instrucao de sistema tecnica (com ou sem contexto PDF).
     response = client.models.generate_content(
         model=model_name,
         contents=contents,
-        config={"system_instruction": build_engineering_system_instruction()},
+        config={"system_instruction": build_engineering_system_instruction(pdf_context)},
     )
     # Retorna texto da resposta ou fallback padrao.
     return response.text if getattr(response, "text", None) else "Sem resposta da API."
+
+
+def parse_assistant_response(response_text: str) -> dict:
+    """Parseia resposta da IA para extrair origem, citacoes e contexto.
+    
+    Retorna dict com:
+    - 'source': 'PDF' ou 'GLOBAL'
+    - 'citation': trecho entre aspas (se houver)
+    - 'context': detalhes da consulta
+    - 'main_text': resposta principal (limpa das tags)
+    """
+    result = {
+        "source": "GLOBAL",
+        "citation": "",
+        "context": "",
+        "main_text": response_text
+    }
+    
+    # Detecta tags de origem.
+    if "[FONTE: PDF]" in response_text:
+        result["source"] = "PDF"
+        response_text = response_text.replace("[FONTE: PDF]", "").strip()
+    elif "[FONTE: GLOBAL]" in response_text:
+        result["source"] = "GLOBAL"
+        response_text = response_text.replace("[FONTE: GLOBAL]", "").strip()
+    
+    # Extrai trecho citado (entre aspas duplas).
+    import re
+    citations = re.findall(r'"([^"]+)"', response_text)
+    if citations:
+        result["citation"] = citations[0]  # Primeira citacao encontrada.
+    
+    # Extrai contexto da consulta (secao apos [CONTEXTO DA CONSULTA]).
+    if "[CONTEXTO DA CONSULTA]" in response_text:
+        parts = response_text.split("[CONTEXTO DA CONSULTA]")
+        result["main_text"] = parts[0].strip()
+        result["context"] = parts[1].strip() if len(parts) > 1 else ""
+    else:
+        result["main_text"] = response_text
+    
+    return result
 
 
 def is_quota_error(exc: Exception) -> bool:
@@ -671,6 +773,533 @@ def render_engineering_header() -> None:
     """, unsafe_allow_html=True)
 
 
+def render_floating_scientific_calculator(theme_mode: str = "light") -> None:
+    # Injeta uma calculadora flutuante no documento pai para nao afetar o layout do Streamlit.
+    if theme_mode == "dark":
+        fab_bg = "linear-gradient(135deg, #1D4ED8 0%, #2563EB 100%)"
+        panel_bg = "rgba(15, 23, 42, 0.55)"
+        panel_border = "rgba(148, 163, 184, 0.45)"
+        text_color = "#E2E8F0"
+        input_bg = "rgba(15, 23, 42, 0.70)"
+        button_bg = "rgba(30, 41, 59, 0.55)"
+        button_hover = "rgba(59, 130, 246, 0.35)"
+        shadow = "0 18px 36px rgba(2, 6, 23, 0.45)"
+    else:
+        fab_bg = "linear-gradient(135deg, #1D4ED8 0%, #3B82F6 100%)"
+        panel_bg = "rgba(248, 250, 252, 0.58)"
+        panel_border = "rgba(100, 116, 139, 0.35)"
+        text_color = "#0F172A"
+        input_bg = "rgba(255, 255, 255, 0.78)"
+        button_bg = "rgba(226, 232, 240, 0.72)"
+        button_hover = "rgba(147, 197, 253, 0.55)"
+        shadow = "0 18px 34px rgba(15, 23, 42, 0.24)"
+
+    html_template = """
+    <script>
+    (function() {
+        const parentDoc = window.parent.document;
+        if (!parentDoc) return;
+
+        const rootId = "eng-calc-root";
+        let root = parentDoc.getElementById(rootId);
+
+        if (!root) {
+            root = parentDoc.createElement("div");
+            root.id = rootId;
+            parentDoc.body.appendChild(root);
+            root.innerHTML = `
+                <style id="eng-calc-style">
+                    #eng-calc-root {
+                        --fab-bg: __FAB_BG__;
+                        --panel-bg: __PANEL_BG__;
+                        --panel-border: __PANEL_BORDER__;
+                        --text-color: __TEXT_COLOR__;
+                        --input-bg: __INPUT_BG__;
+                        --button-bg: __BUTTON_BG__;
+                        --button-hover: __BUTTON_HOVER__;
+                        --shadow: __SHADOW__;
+                    }
+                    #eng-calc-fab {
+                        position: fixed;
+                        right: 22px;
+                        bottom: 24px;
+                        width: 58px;
+                        height: 58px;
+                        border: 1px solid rgba(255,255,255,0.25);
+                        border-radius: 999px;
+                        background: var(--fab-bg);
+                        color: #FFFFFF;
+                        font-size: 25px;
+                        cursor: pointer;
+                        z-index: 99990;
+                        box-shadow: var(--shadow);
+                    }
+                    #eng-calc-fab:hover {
+                        transform: translateY(-1px) scale(1.02);
+                    }
+                    #eng-calc-panel {
+                        position: fixed;
+                        right: 22px;
+                        bottom: 94px;
+                        width: 380px;
+                        max-width: calc(100vw - 22px);
+                        padding: 12px;
+                        border-radius: 16px;
+                        border: 1px solid var(--panel-border);
+                        background: var(--panel-bg);
+                        color: var(--text-color);
+                        backdrop-filter: blur(12px);
+                        -webkit-backdrop-filter: blur(12px);
+                        box-shadow: var(--shadow);
+                        z-index: 99991;
+                        display: none;
+                        user-select: none;
+                    }
+                    #eng-calc-header {
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;
+                        margin-bottom: 8px;
+                        cursor: move;
+                        font-size: 0.92rem;
+                        font-weight: 700;
+                    }
+                    #eng-calc-mode {
+                        font-size: 0.76rem;
+                        opacity: 0.9;
+                        font-weight: 600;
+                    }
+                    #eng-calc-close {
+                        background: transparent;
+                        border: 0;
+                        color: var(--text-color);
+                        font-size: 16px;
+                        cursor: pointer;
+                    }
+                    #eng-calc-display {
+                        width: 100%;
+                        box-sizing: border-box;
+                        border: 1px solid var(--panel-border);
+                        border-radius: 10px;
+                        min-height: 46px;
+                        padding: 8px 10px;
+                        margin-bottom: 8px;
+                        background: var(--input-bg);
+                        color: var(--text-color);
+                        text-align: right;
+                        font-size: 1.08rem;
+                    }
+                    #eng-calc-grid {
+                        display: grid;
+                        grid-template-columns: repeat(6, 1fr);
+                        gap: 7px;
+                    }
+                    .eng-calc-btn {
+                        border: 1px solid var(--panel-border);
+                        border-radius: 9px;
+                        background: var(--button-bg);
+                        color: var(--text-color);
+                        padding: 7px 3px;
+                        font-weight: 700;
+                        font-size: 0.84rem;
+                        cursor: pointer;
+                    }
+                    .eng-calc-btn:hover {
+                        background: var(--button-hover);
+                    }
+                    .eng-calc-btn-op {
+                        font-size: 0.95rem;
+                    }
+                    .eng-calc-btn-wide {
+                        grid-column: span 2;
+                    }
+                    #eng-calc-actions {
+                        display: grid;
+                        grid-template-columns: 1fr 1fr;
+                        gap: 7px;
+                        margin-top: 8px;
+                    }
+                    #eng-calc-copy,
+                    #eng-calc-eq {
+                        border-radius: 10px;
+                        border: 1px solid var(--panel-border);
+                        background: var(--fab-bg);
+                        color: #FFFFFF;
+                        padding: 9px 8px;
+                        font-weight: 700;
+                        cursor: pointer;
+                    }
+                </style>
+
+                <button id="eng-calc-fab" title="Abrir calculadora científica">🖩</button>
+
+                <div id="eng-calc-panel" aria-label="Calculadora Científica">
+                    <div id="eng-calc-header">
+                        <span>Calculadora Científica</span>
+                        <span id="eng-calc-mode">DEG</span>
+                        <button id="eng-calc-close" title="Fechar">✕</button>
+                    </div>
+                    <input id="eng-calc-display" type="text" value="" placeholder="0" readonly />
+
+                    <div id="eng-calc-grid">
+                        <button class="eng-calc-btn" data-ins="sin(">sin</button>
+                        <button class="eng-calc-btn" data-ins="cos(">cos</button>
+                        <button class="eng-calc-btn" data-ins="tan(">tan</button>
+                        <button class="eng-calc-btn" data-ins="asin(">sin⁻1</button>
+                        <button class="eng-calc-btn" data-ins="acos(">cos⁻1</button>
+                        <button class="eng-calc-btn" data-ins="atan(">tan⁻1</button>
+
+                        <button class="eng-calc-btn" data-ins="sinh(">sinh</button>
+                        <button class="eng-calc-btn" data-ins="cosh(">cosh</button>
+                        <button class="eng-calc-btn" data-ins="tanh(">tanh</button>
+                        <button class="eng-calc-btn" data-ins="sqrt(">√</button>
+                        <button class="eng-calc-btn" data-ins="cbrt(">∛</button>
+                        <button class="eng-calc-btn" data-act="toggle-mode">DRG</button>
+
+                        <button class="eng-calc-btn" data-ins="log(">log</button>
+                        <button class="eng-calc-btn" data-ins="ln(">ln</button>
+                        <button class="eng-calc-btn" data-ins="exp(">eˣ</button>
+                        <button class="eng-calc-btn" data-ins="pow10(">10ˣ</button>
+                        <button class="eng-calc-btn" data-ins="abs(">abs</button>
+                        <button class="eng-calc-btn" data-act="eng">ENG</button>
+
+                        <button class="eng-calc-btn" data-ins="nPr(">nPr</button>
+                        <button class="eng-calc-btn" data-ins="nCr(">nCr</button>
+                        <button class="eng-calc-btn" data-ins="fact(">x!</button>
+                        <button class="eng-calc-btn" data-ins="^2">x²</button>
+                        <button class="eng-calc-btn" data-ins="^3">x³</button>
+                        <button class="eng-calc-btn" data-ins="^">xʸ</button>
+
+                        <button class="eng-calc-btn" data-ins="(">(</button>
+                        <button class="eng-calc-btn" data-ins=")">)</button>
+                        <button class="eng-calc-btn" data-ins=",">,</button>
+                        <button class="eng-calc-btn" data-ins="pi">π</button>
+                        <button class="eng-calc-btn" data-ins="e">e</button>
+                        <button class="eng-calc-btn" data-ins="ANS">Ans</button>
+
+                        <button class="eng-calc-btn" data-ins="7">7</button>
+                        <button class="eng-calc-btn" data-ins="8">8</button>
+                        <button class="eng-calc-btn" data-ins="9">9</button>
+                        <button class="eng-calc-btn eng-calc-btn-op" data-ins="/">÷</button>
+                        <button class="eng-calc-btn" data-act="del">DEL</button>
+                        <button class="eng-calc-btn" data-act="clear-all">AC</button>
+
+                        <button class="eng-calc-btn" data-ins="4">4</button>
+                        <button class="eng-calc-btn" data-ins="5">5</button>
+                        <button class="eng-calc-btn" data-ins="6">6</button>
+                        <button class="eng-calc-btn eng-calc-btn-op" data-ins="*">×</button>
+                        <button class="eng-calc-btn" data-act="m-plus">M+</button>
+                        <button class="eng-calc-btn" data-act="m-minus">M-</button>
+
+                        <button class="eng-calc-btn" data-ins="1">1</button>
+                        <button class="eng-calc-btn" data-ins="2">2</button>
+                        <button class="eng-calc-btn" data-ins="3">3</button>
+                        <button class="eng-calc-btn eng-calc-btn-op" data-ins="-">-</button>
+                        <button class="eng-calc-btn" data-act="mr">MR</button>
+                        <button class="eng-calc-btn" data-act="mc">MC</button>
+
+                        <button class="eng-calc-btn" data-ins="0">0</button>
+                        <button class="eng-calc-btn" data-ins=".">.</button>
+                        <button class="eng-calc-btn" data-act="percent">%</button>
+                        <button class="eng-calc-btn eng-calc-btn-op" data-ins="+">+</button>
+                        <button class="eng-calc-btn eng-calc-btn-wide" data-ins="rand()">Rnd</button>
+                    </div>
+
+                    <div id="eng-calc-actions">
+                        <button id="eng-calc-copy">Copiar Resultado</button>
+                        <button id="eng-calc-eq">Calcular =</button>
+                    </div>
+                </div>
+            `;
+
+            const fab = parentDoc.getElementById("eng-calc-fab");
+            const panel = parentDoc.getElementById("eng-calc-panel");
+            const closeBtn = parentDoc.getElementById("eng-calc-close");
+            const display = parentDoc.getElementById("eng-calc-display");
+            const copyBtn = parentDoc.getElementById("eng-calc-copy");
+            const eqBtn = parentDoc.getElementById("eng-calc-eq");
+            const header = parentDoc.getElementById("eng-calc-header");
+            const modeLabel = parentDoc.getElementById("eng-calc-mode");
+
+            let isDeg = true;
+            let ansValue = 0;
+            let memoryValue = 0;
+
+            function getDisplayValue() {
+                return (display.value || "").trim();
+            }
+
+            function setDisplayValue(value) {
+                display.value = String(value);
+            }
+
+            function toRad(v) {
+                return isDeg ? (v * Math.PI / 180) : v;
+            }
+
+            function fromRad(v) {
+                return isDeg ? (v * 180 / Math.PI) : v;
+            }
+
+            function factorial(n) {
+                if (!Number.isFinite(n) || n < 0 || Math.floor(n) !== n) {
+                    throw new Error("fatorial invalido");
+                }
+                let out = 1;
+                for (let i = 2; i <= n; i += 1) out *= i;
+                return out;
+            }
+
+            function nPr(n, r) {
+                n = Math.floor(n);
+                r = Math.floor(r);
+                if (n < 0 || r < 0 || r > n) throw new Error("nPr invalido");
+                let out = 1;
+                for (let i = 0; i < r; i += 1) out *= (n - i);
+                return out;
+            }
+
+            function nCr(n, r) {
+                n = Math.floor(n);
+                r = Math.floor(r);
+                if (n < 0 || r < 0 || r > n) throw new Error("nCr invalido");
+                r = Math.min(r, n - r);
+                let num = 1;
+                let den = 1;
+                for (let i = 1; i <= r; i += 1) {
+                    num *= (n - r + i);
+                    den *= i;
+                }
+                return num / den;
+            }
+
+            function normalizeResult(value) {
+                if (typeof value !== "number" || !isFinite(value)) return "Erro";
+                const rounded = Number(value.toPrecision(12));
+                return String(rounded);
+            }
+
+            function safeEvaluate(expr) {
+                if (!expr) return "";
+                if (!/^[A-Za-z0-9_+\-*/().,^\s]+$/.test(expr)) return "Erro";
+
+                const jsExpr = expr.replace(/\^/g, "**");
+                const scope = {
+                    pi: Math.PI,
+                    e: Math.E,
+                    ANS: ansValue,
+                    M: memoryValue,
+                    sin: (x) => Math.sin(toRad(x)),
+                    cos: (x) => Math.cos(toRad(x)),
+                    tan: (x) => Math.tan(toRad(x)),
+                    asin: (x) => fromRad(Math.asin(x)),
+                    acos: (x) => fromRad(Math.acos(x)),
+                    atan: (x) => fromRad(Math.atan(x)),
+                    sinh: (x) => Math.sinh(x),
+                    cosh: (x) => Math.cosh(x),
+                    tanh: (x) => Math.tanh(x),
+                    sqrt: (x) => Math.sqrt(x),
+                    cbrt: (x) => Math.cbrt(x),
+                    abs: (x) => Math.abs(x),
+                    log: (x) => Math.log10(x),
+                    ln: (x) => Math.log(x),
+                    exp: (x) => Math.exp(x),
+                    pow10: (x) => Math.pow(10, x),
+                    fact: (x) => factorial(x),
+                    nPr: (n, r) => nPr(n, r),
+                    nCr: (n, r) => nCr(n, r),
+                    rand: () => Math.random()
+                };
+
+                try {
+                    const keys = Object.keys(scope);
+                    const values = Object.values(scope);
+                    const result = Function(...keys, '"use strict"; return (' + jsExpr + ');')(...values);
+                    return normalizeResult(result);
+                } catch (e) {
+                    return "Erro";
+                }
+            }
+
+            function calculateCurrent() {
+                const result = safeEvaluate(getDisplayValue());
+                setDisplayValue(result);
+                if (result !== "Erro" && result !== "") {
+                    ansValue = parseFloat(result);
+                }
+            }
+
+            function insertText(text) {
+                const current = getDisplayValue();
+                setDisplayValue((current === "Erro" ? "" : current) + text);
+            }
+
+            function updateModeLabel() {
+                modeLabel.textContent = isDeg ? "DEG" : "RAD";
+            }
+
+            fab.addEventListener("click", () => {
+                panel.style.display = panel.style.display === "block" ? "none" : "block";
+            });
+
+            closeBtn.addEventListener("click", () => {
+                panel.style.display = "none";
+            });
+
+            eqBtn.addEventListener("click", () => {
+                calculateCurrent();
+            });
+
+            parentDoc.querySelectorAll("#eng-calc-grid .eng-calc-btn").forEach((btn) => {
+                btn.addEventListener("click", () => {
+                    const ins = btn.getAttribute("data-ins");
+                    const act = btn.getAttribute("data-act");
+
+                    if (ins !== null) {
+                        insertText(ins);
+                        return;
+                    }
+
+                    if (act === "clear-all") {
+                        setDisplayValue("");
+                        return;
+                    }
+
+                    if (act === "del") {
+                        const current = getDisplayValue();
+                        setDisplayValue(current.length ? current.slice(0, -1) : "");
+                        return;
+                    }
+
+                    if (act === "toggle-mode") {
+                        isDeg = !isDeg;
+                        updateModeLabel();
+                        return;
+                    }
+
+                    if (act === "percent") {
+                        const raw = safeEvaluate(getDisplayValue());
+                        if (raw === "Erro" || raw === "") {
+                            setDisplayValue("Erro");
+                        } else {
+                            setDisplayValue(normalizeResult(parseFloat(raw) / 100));
+                        }
+                        return;
+                    }
+
+                    if (act === "eng") {
+                        const raw = safeEvaluate(getDisplayValue());
+                        if (raw === "Erro" || raw === "") {
+                            setDisplayValue("Erro");
+                        } else {
+                            setDisplayValue(Number(parseFloat(raw)).toExponential(3));
+                        }
+                        return;
+                    }
+
+                    if (act === "m-plus") {
+                        const raw = safeEvaluate(getDisplayValue());
+                        if (raw !== "Erro" && raw !== "") memoryValue += parseFloat(raw);
+                        return;
+                    }
+
+                    if (act === "m-minus") {
+                        const raw = safeEvaluate(getDisplayValue());
+                        if (raw !== "Erro" && raw !== "") memoryValue -= parseFloat(raw);
+                        return;
+                    }
+
+                    if (act === "mr") {
+                        insertText(normalizeResult(memoryValue));
+                        return;
+                    }
+
+                    if (act === "mc") {
+                        memoryValue = 0;
+                    }
+                });
+            });
+
+            copyBtn.addEventListener("click", async () => {
+                const value = getDisplayValue();
+                if (!value) return;
+                try {
+                    await window.parent.navigator.clipboard.writeText(value);
+                    copyBtn.textContent = "Resultado copiado";
+                } catch (e) {
+                    copyBtn.textContent = "Nao foi possivel copiar";
+                }
+                setTimeout(() => { copyBtn.textContent = "Copiar Resultado"; }, 1200);
+            });
+
+            // Atalhos de teclado para uso rapido.
+            parentDoc.addEventListener("keydown", (evt) => {
+                if (panel.style.display !== "block") return;
+                if (evt.key === "Enter") {
+                    evt.preventDefault();
+                    calculateCurrent();
+                }
+                if (evt.key === "Escape") {
+                    panel.style.display = "none";
+                }
+            });
+
+            // Drag do popup pela barra de cabecalho.
+            let dragging = false;
+            let offsetX = 0;
+            let offsetY = 0;
+
+            header.addEventListener("mousedown", (evt) => {
+                dragging = true;
+                const rect = panel.getBoundingClientRect();
+                offsetX = evt.clientX - rect.left;
+                offsetY = evt.clientY - rect.top;
+                panel.style.right = "auto";
+                panel.style.bottom = "auto";
+                panel.style.left = rect.left + "px";
+                panel.style.top = rect.top + "px";
+            });
+
+            parentDoc.addEventListener("mousemove", (evt) => {
+                if (!dragging) return;
+                panel.style.left = (evt.clientX - offsetX) + "px";
+                panel.style.top = (evt.clientY - offsetY) + "px";
+            });
+
+            parentDoc.addEventListener("mouseup", () => {
+                dragging = false;
+            });
+        }
+
+        // Atualiza tema em rerun sem recriar elementos.
+        root.style.setProperty("--fab-bg", "__FAB_BG__");
+        root.style.setProperty("--panel-bg", "__PANEL_BG__");
+        root.style.setProperty("--panel-border", "__PANEL_BORDER__");
+        root.style.setProperty("--text-color", "__TEXT_COLOR__");
+        root.style.setProperty("--input-bg", "__INPUT_BG__");
+        root.style.setProperty("--button-bg", "__BUTTON_BG__");
+        root.style.setProperty("--button-hover", "__BUTTON_HOVER__");
+        root.style.setProperty("--shadow", "__SHADOW__");
+    })();
+    </script>
+    """
+
+    html = (
+        html_template
+        .replace("__FAB_BG__", fab_bg)
+        .replace("__PANEL_BG__", panel_bg)
+        .replace("__PANEL_BORDER__", panel_border)
+        .replace("__TEXT_COLOR__", text_color)
+        .replace("__INPUT_BG__", input_bg)
+        .replace("__BUTTON_BG__", button_bg)
+        .replace("__BUTTON_HOVER__", button_hover)
+        .replace("__SHADOW__", shadow)
+    )
+
+    # Componente sem altura visivel; script injeta elementos no documento pai.
+    components.html(html, height=0)
+
+
 def init_state() -> None:
     # Inicializa chaves da sessao para evitar KeyError durante o uso.
     if "messages" not in st.session_state:
@@ -713,6 +1342,10 @@ def init_state() -> None:
             st.session_state.conversa_ativa = 0
     if "confirm_clear_conversations_flag" not in st.session_state:
         st.session_state.confirm_clear_conversations_flag = False
+    if "pdf_context" not in st.session_state:
+        st.session_state.pdf_context = None
+    if "pdf_filename" not in st.session_state:
+        st.session_state.pdf_filename = None
 
     # Garante que o chat principal siga a conversa ativa.
     ensure_active_conversation()
@@ -804,16 +1437,16 @@ def render_calc_module() -> None:
 
 
 def render_assistant_module(api_key: str, model_name: Optional[str], full_chat: bool = False) -> None:
-    # Modulo de chat tecnico com suporte a texto + imagem.
+    # Modulo de chat tecnico com suporte a texto + imagem + PDF.
     st.subheader("🤖 Assistente Técnico AI")
-    st.caption("Suporte especializado para análise de questões de engenharia com texto e imagem.")
+    st.caption("Suporte especializado para análise de questões de engenharia com texto, imagem e manual técnico (PDF).")
 
     # Garante estado consistente da conversa ativa no inicio do modulo.
     ensure_active_conversation()
     load_conversation(st.session_state.conversa_ativa)
 
     # Acoes rapidas do chat.
-    quick_c1, quick_c2 = st.columns([1, 1])
+    quick_c1, quick_c2, quick_c3 = st.columns([1, 1, 1])
     with quick_c1:
         # Limpa historico da conversa.
         st.button("Limpar conversa", use_container_width=True, on_click=cb_clear_active_chat_messages)
@@ -823,6 +1456,13 @@ def render_assistant_module(api_key: str, model_name: Optional[str], full_chat: 
             st.session_state.uploader_nonce += 1
             st.session_state.clipboard_image = None
             st.rerun()
+    with quick_c3:
+        # Limpa PDF carregado.
+        if st.session_state.pdf_context:
+            if st.button("🗑️ Remover PDF", use_container_width=True):
+                st.session_state.pdf_context = None
+                st.session_state.pdf_filename = None
+                st.rerun()
 
     # Botao para colar imagem do clipboard (CTRL+V).
     pasted = paste_image_button(
@@ -845,6 +1485,24 @@ def render_assistant_module(api_key: str, model_name: Optional[str], full_chat: 
         label_visibility="collapsed",
     )
     st.caption("📸 Clique aqui e dê CTRL+V para colar um print")
+
+    # Uploader de PDF para manual tecnico.
+    pdf_arquivo = st.file_uploader(
+        "📚 Carregar Manual Técnico (PDF)",
+        type=["pdf"],
+        accept_multiple_files=False,
+        key=f"pdf_uploader_{st.session_state.uploader_nonce}",
+        label_visibility="collapsed",
+    )
+    
+    # Processa PDF quando carregado.
+    if pdf_arquivo is not None:
+        st.session_state.pdf_filename = pdf_arquivo.name
+        st.session_state.pdf_context = extract_text_from_pdf(pdf_arquivo)
+        st.success(f"✅ Manual carregado: {pdf_arquivo.name}")
+    
+    if st.session_state.pdf_context:
+        st.caption(f"📚 Manual técnico ativo: {st.session_state.pdf_filename}")
 
     # Prioriza imagem do clipboard; se nao houver, usa upload.
     prepared_image = None
@@ -910,8 +1568,8 @@ def render_assistant_module(api_key: str, model_name: Optional[str], full_chat: 
         with st.spinner("Analisando dados e resolvendo passo a passo..."):
             request_success = True
             try:
-                # Chama modelo Gemini com prompt + imagem opcional.
-                answer = ask_gemini(api_key, model_name, user_prompt, prepared_image)
+                # Chama modelo Gemini com prompt + imagem opcional + contexto PDF.
+                answer = ask_gemini(api_key, model_name, user_prompt, prepared_image, st.session_state.pdf_context)
             except Exception as exc:
                 request_success = False
                 # Trata erro de limite de uso.
@@ -926,8 +1584,26 @@ def render_assistant_module(api_key: str, model_name: Optional[str], full_chat: 
                     # Mensagem generica para outros erros.
                     answer = f"Erro na chamada da API: {exc}"
 
-            # Exibe resposta em formato de relatorio tecnico.
-            st.markdown(f"## Relatório Técnico\n\n{answer}")
+            # Parseia resposta para extrair origem, citacoes e contexto.
+            parsed = parse_assistant_response(answer)
+            
+            # Exibe resposta com indicador visual de origem.
+            if parsed["source"] == "PDF":
+                # Destaca resposta vinda do PDF.
+                st.info(f"📚 **Resposta baseada no manual técnico carregado**\n\n{parsed['main_text']}")
+                
+                # Se houver citacao, exibe em destaque.
+                if parsed["citation"]:
+                    st.markdown(f"**📌 Trecho do Manual:**\n> \"{parsed['citation']}\"")
+            else:
+                # Aviso discreto para resposta de conhecimento geral.
+                st.warning("⚠️ Informação não encontrada no manual, utilizando base global de conhecimento.")
+                st.markdown(f"## Relatório Técnico\n\n{parsed['main_text']}")
+            
+            # Exibe detalhes de contexto em expander.
+            if parsed["context"]:
+                with st.expander("🔍 Detalhes da Consulta"):
+                    st.markdown(parsed["context"])
 
     # Salva resposta no historico e no estado para uso posterior.
     st.session_state.messages.append({"role": "assistant", "text": answer})
@@ -1053,6 +1729,19 @@ def main() -> None:
             unsafe_allow_html=True,
         )
 
+        # Indicador de modo híbrido com PDF ativo.
+        if st.session_state.pdf_context:
+            st.markdown(
+                """
+                <div class="sb-status" style="border-color: rgba(34, 197, 94, 0.45); background: rgba(34, 197, 94, 0.12);">
+                    <span class="sb-status-dot"></span>
+                    <strong>📚 Modo de Consulta Híbrida Ativo</strong><br>
+                    <span style="opacity:0.88;">Manual técnico carregado</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
         st.divider()
         st.markdown('<div class="sb-section-title">SUPORTE</div>', unsafe_allow_html=True)
         if st.button("📘 Guia Técnico", use_container_width=True, key="support_guide"):
@@ -1118,6 +1807,7 @@ def main() -> None:
     if page == "📊 Dashboard de Cálculos":
         render_engineering_header()
         render_calc_module()
+        render_floating_scientific_calculator(theme_mode=theme_mode)
     else:
         render_assistant_module(api_key=api_key, model_name=st.session_state.active_model, full_chat=True)
 
